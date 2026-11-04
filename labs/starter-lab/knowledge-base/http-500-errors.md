@@ -22,6 +22,34 @@ Azure Container Apps endpoints returning HTTP 500 errors. Logs stored in Log Ana
 az containerapp logs show -g <resourceGroup> -n <appName> --tail 300
 az containerapp logs show -g <resourceGroup> -n <appName> --tail 300 --format text
 ```
+**If this returns `Got bad status from the logstream API: 403`**, the identity lacks log-stream access (`Microsoft.App/containerApps/getAuthtoken/action`). Do not retry — read the same logs from Log Analytics instead:
+```kql
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == "<appName>" and RevisionName_s == "<revisionName>"
+| top 300 by TimeGenerated desc
+| project TimeGenerated, Stream_s, Log_s
+```
+
+---
+
+## Phase 0: Data Source Pre-Check (Run Before Any KQL)
+
+An empty query result only means "no errors" if the table actually has data for the app and window. Run this once in the Log Analytics workspace:
+```kql
+union withsource=T ContainerAppConsoleLogs_CL, ContainerAppSystemLogs_CL, AzureMetrics, AppRequests, AppExceptions, AppDependencies, AppPerformanceCounters
+| where TimeGenerated > ago(24h)
+| summarize rows1h = countif(TimeGenerated > ago(1h)), rows24h = count(), lastSeen = max(TimeGenerated) by T
+```
+How to read it:
+- **Table missing from the output** = no data at all. For `App*` tables this means the app is not instrumented with Application Insights → Phases 1.1, 1.2, 1.6, 3.2, 3.3, 4, 5 and 8 will always be empty. Use the `ContainerAppConsoleLogs_CL` queries and the `Requests` metric (Phase 3.4) instead.
+- **`AzureMetrics` missing** = no diagnostic setting exports platform metrics to the workspace. Use `az monitor metrics list` (Phase 1.4) instead of query 1.3.
+- **`rows1h` = 0 but `rows24h` > 0** = the incident is outside the default `ago(1h)` window. Replace `ago(1h)` in every query with the incident window (e.g. `between (datetime(<start>) .. datetime(<end>))`, taken from the alert fire time).
+- `App*` rows can belong to other apps sharing the workspace (e.g. the SRE Agent's own `GenAI` dependencies). Check `AppRoleName` before trusting them.
+
+**Query notes:**
+- Classic App Insights names (`requests`, `exceptions`, `dependencies`, `performanceCounters`) work only via `az monitor app-insights query --app <appInsightsName> -g <rg>`. In the Log Analytics workspace use `AppRequests`, `AppExceptions`, `AppDependencies`, `AppPerformanceCounters` (columns are PascalCase: `ResultCode`, `DurationMs`, `OperationId`, ...).
+- The `ContainerApp*_CL` queries below are not scoped to one app. If the workspace is shared, add `| where ContainerAppName_s == "<appName>"`.
+- CLI: `az monitor log-analytics query -w <workspaceCustomerId> --analytics-query "<kql>" -o json`
 
 ---
 
@@ -105,6 +133,8 @@ requests
 | Memory % | > 75% sustained | > 90% sustained | Scale up memory or fix leak |
 | Memory Working Set | Steadily increasing | Near limit | Investigate memory leak |
 
+> **Do not rule out OOM from metrics alone.** A managed runtime (e.g. .NET) can throw `System.OutOfMemoryException` per request when it hits its GC heap limit while the container stays up (`RestartCount` = 0) and container memory metrics look low. Always run query 1.5 / 3.1 over the incident window as well.
+
 ---
 
 ## Phase 2: Initial Triage
@@ -148,7 +178,9 @@ ContainerAppConsoleLogs_CL
 ContainerAppConsoleLogs_CL
 | where TimeGenerated > ago(1h)
 | where Log_s contains "error" or Log_s contains "exception"
-| extend ErrorMessage = extract("(Exception|Error|Failed|Fault).*", 0, Log_s)
+// (?i) makes extract case-insensitive like `contains`; otherwise lines such as
+// "An unhandled exception was thrown" fall into an empty ErrorMessage bucket
+| extend ErrorMessage = extract("(?i)(Exception|Error|Failed|Fault).*", 0, Log_s)
 | summarize Count = count(), 
     FirstSeen = min(TimeGenerated), 
     LastSeen = max(TimeGenerated)
@@ -182,6 +214,14 @@ by bin(timestamp, 5m)
 | order by timestamp desc
 ```
 
+### 3.4 HTTP Status Counts Without App Insights (Azure Monitor Metric)
+Works even when the app has no App Insights instrumentation:
+```bash
+az monitor metrics list --resource <containerAppResourceId> --metrics Requests \
+  --interval PT5M --offset 24h --aggregation Total --dimension statusCodeCategory -o json
+```
+Each time series is one status category (`2xx`, `4xx`, `5xx`). Non-zero `5xx` totals give the error window to use in every other query.
+
 ---
 
 ## Phase 4: Exception Details
@@ -208,6 +248,7 @@ exceptions
 ```
 
 ### 4.3 Trace Correlation for Specific Error
+Requires an `operation_Id` from 4.2. If 4.1/4.2 are empty (no App Insights), skip this; console logs have no operation id — correlate by time window and `RevisionName_s` instead.
 ```kql
 // Replace <operation_Id> with value from exceptions query
 let targetOpId = "<operation_Id>";
@@ -267,10 +308,12 @@ by target, name
 
 ### 6.1 Container Restarts/Crashes
 ```kql
+// ContainerAppSystemLogs_CL has no ContainerName_s column (SEM0100 error) - use Reason_s
 ContainerAppSystemLogs_CL
 | where TimeGenerated > ago(1h)
 | where Log_s contains "restart" or Log_s contains "crash" or Log_s contains "OOMKilled"
-| project TimeGenerated, Log_s, ContainerName_s, RevisionName_s
+| where Reason_s != "ContainerAppReady"  // drops benign "No revision restart or provisioning was needed."
+| project TimeGenerated, ContainerAppName_s, RevisionName_s, Reason_s, Log_s
 | order by TimeGenerated desc
 ```
 
@@ -296,14 +339,19 @@ az containerapp env show --ids <resourceId> --subscription <subId>
 ```kql
 ContainerAppSystemLogs_CL
 | where TimeGenerated > ago(24h)
-| where Log_s contains "revision" or Log_s contains "deploy"
-| project TimeGenerated, Log_s, RevisionName_s
+| where Reason_s in ("RevisionCreation", "RevisionReady", "RevisionUpdate")
+| project TimeGenerated, ContainerAppName_s, Reason_s, Log_s
 | order by TimeGenerated desc
 ```
+Notes:
+- On `RevisionCreation` rows, `RevisionName_s` is the *previous* revision; the new revision name is in `Log_s` ("Creating a new revision: ..."). Use `RevisionReady` for the new revision's go-live time.
+- `RevisionUpdate` with "No new revision was provisioned" means a config/image write did **not** roll replicas — the old code may still be running.
 
 ### 7.2 Errors After Deployment (Timeline)
 ```kql
-let deployTime = datetime(2025-12-19T10:00:00Z);  // Replace with actual deploy time
+// Set deployTime to the RevisionReady time from 7.1 (or the active revision's createdTime:
+// az containerapp revision list -g <rg> -n <app> --query "[].{name:name,created:properties.createdTime}")
+let deployTime = datetime(2025-12-19T10:00:00Z);
 ContainerAppConsoleLogs_CL
 | where TimeGenerated between (deployTime .. (deployTime + 2h))
 | where Log_s contains "error" or Log_s contains "exception"
